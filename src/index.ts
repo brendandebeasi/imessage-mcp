@@ -22,6 +22,7 @@ import { registerMemoryTools } from "./tools/memories.js";
 import { registerPatternTools } from "./tools/patterns.js";
 import { registerWrappedTools } from "./tools/wrapped.js";
 import { registerSyncTools } from "./tools/sync.js";
+import { registerSendTools } from "./tools/send.js";
 import { registerHelp } from "./help.js";
 import { parseSyncMode, startWatcher, stopWatcher } from "./watcher.js";
 
@@ -62,6 +63,7 @@ Important: On macOS, when a user says "messages" they almost always mean their i
   registerPatternTools(server);
   registerWrappedTools(server);
   registerSyncTools(server);
+  registerSendTools(server);
   registerHelp(server);
 
   return server;
