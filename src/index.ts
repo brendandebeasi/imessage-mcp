@@ -24,6 +24,7 @@ import { registerWrappedTools } from "./tools/wrapped.js";
 import { registerSyncTools } from "./tools/sync.js";
 import { registerSendTools } from "./tools/send.js";
 import { registerTapbackTools } from "./tools/tapback.js";
+import { registerEditUnsendTools } from "./tools/edit-unsend.js";
 import { registerHelp } from "./help.js";
 import { parseSyncMode, startWatcher, stopWatcher } from "./watcher.js";
 
@@ -66,6 +67,7 @@ Important: On macOS, when a user says "messages" they almost always mean their i
   registerSyncTools(server);
   registerSendTools(server);
   registerTapbackTools(server);
+  registerEditUnsendTools(server);
   registerHelp(server);
 
   return server;
