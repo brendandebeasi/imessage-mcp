@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `send_message` now accepts `attachments_b64`: inline base64 attachments for callers without Mac filesystem access (e.g. Sane on prod). Decoded to a secure per-call temp dir, attached by path, and cleaned up after send.
+
 ## [1.5.0] - 2026-02-25
 
 ### Added

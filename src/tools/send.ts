@@ -14,7 +14,8 @@
 //     the response.
 
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -74,6 +75,82 @@ function resolveRecipient(to: string): RecipientResolution {
   return { kind: "buddy", identifier: to };
 }
 
+// ── Inline (base64) attachments ───────────────────────────────────────
+// Sane runs on prod with no filesystem access to this Mac, so it cannot
+// use the path-based `attachments` param. Instead it passes the bytes
+// inline as `attachments_b64`: a JSON list of objects shaped like
+//   {"filename": "photo.jpg", "content_base64": "<b64>"}
+// Each entry is decoded and written to a fresh, secure per-call temp dir
+// (mkdtemp under the OS tempdir); the resolved paths then feed the same
+// AppleScript path used for `attachments`. The caller must remove the
+// returned tmpdir when done. Mirrors the apple-mail-mcp fork pattern.
+
+export interface StagedB64 {
+  paths: string[];
+  tmpdir: string | null;
+  error: string | null;
+}
+
+export function stageB64Attachments(attachmentsB64: string): StagedB64 {
+  let items: unknown;
+  try {
+    items = JSON.parse(attachmentsB64);
+  } catch (e) {
+    return { paths: [], tmpdir: null, error: `attachments_b64 must be valid JSON: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (!Array.isArray(items)) {
+    return { paths: [], tmpdir: null, error: "attachments_b64 must be a JSON list of {filename, content_base64}." };
+  }
+  if (items.length === 0) {
+    return { paths: [], tmpdir: null, error: "attachments_b64 is an empty list." };
+  }
+
+  const tmpdir = mkdtempSync(path.join(os.tmpdir(), "sane-b64-att-"));
+  const fail = (msg: string): StagedB64 => {
+    rmSync(tmpdir, { recursive: true, force: true });
+    return { paths: [], tmpdir: null, error: msg };
+  };
+
+  const paths: string[] = [];
+  for (let idx = 0; idx < items.length; idx++) {
+    const item = items[idx] as Record<string, unknown>;
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return fail(`attachments_b64[${idx}] must be an object with filename and content_base64.`);
+    }
+    const rawName = (item.filename as string) || `attachment-${idx}`;
+    const contentB64 = item.content_base64;
+    if (!contentB64 || typeof contentB64 !== "string") {
+      return fail(`attachments_b64[${idx}] is missing content_base64.`);
+    }
+    // Strip any path component — the recipient only sees the basename and
+    // we never want "../etc/passwd" escaping the temp dir.
+    const safeName = path.basename(String(rawName)) || `attachment-${idx}`;
+    let payload: Buffer;
+    try {
+      payload = Buffer.from(contentB64, "base64");
+      if (payload.length === 0 && contentB64.length > 0) {
+        return fail(`attachments_b64[${idx}] base64 decode failed: empty output`);
+      }
+    } catch (e) {
+      return fail(`attachments_b64[${idx}] base64 decode failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // Guard against two entries with the same display name clobbering.
+    let dest = path.join(tmpdir, safeName);
+    if (existsSync(dest)) {
+      const ext = path.extname(safeName);
+      const stem = path.basename(safeName, ext);
+      dest = path.join(tmpdir, `${stem}-${idx}${ext}`);
+    }
+    try {
+      writeFileSync(dest, payload);
+    } catch (e) {
+      return fail(`attachments_b64[${idx}] write failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    paths.push(dest);
+  }
+  return { paths, tmpdir, error: null };
+}
+
 function buildSendScript(
   rec: RecipientResolution,
   text: string | undefined,
@@ -105,7 +182,7 @@ function buildSendScript(
 export function registerSendTools(server: McpServer) {
   server.tool(
     "send_message",
-    "Send an iMessage (or SMS fallback) to a contact or group chat. `to` may be a phone number, email, chat_identifier (e.g. 'chat123456789'), or full chat GUID. Optional `attachments` is a list of absolute file paths the host (Mac) can read. Returns once Messages.app has accepted the message — there is NO delivered/read signal in the response.",
+    "Send an iMessage (or SMS fallback) to a contact or group chat. `to` may be a phone number, email, chat_identifier (e.g. 'chat123456789'), or full chat GUID. Optional `attachments` is a list of absolute file paths the host (Mac) can read; `attachments_b64` carries inline bytes for callers without Mac filesystem access. Returns once Messages.app has accepted the message — there is NO delivered/read signal in the response.",
     {
       to: z
         .string()
@@ -119,6 +196,12 @@ export function registerSendTools(server: McpServer) {
         .array(z.string())
         .optional()
         .describe("Absolute file paths on the Mac to attach (images, documents, etc.)"),
+      attachments_b64: z
+        .string()
+        .optional()
+        .describe(
+          'Inline attachments for callers without filesystem access to this Mac (e.g. Sane on prod). A JSON list of objects {"filename": "<name>", "content_base64": "<base64 bytes>"}. Each is decoded to a secure per-call temp file, attached by path, and deleted after the send. Combine freely with `attachments`.',
+        ),
       service: z
         .enum(["iMessage", "SMS"])
         .optional()
@@ -132,69 +215,91 @@ export function registerSendTools(server: McpServer) {
     },
     async (params) => {
       const text = params.text ?? "";
-      const attachments = params.attachments ?? [];
-      if (text.length === 0 && attachments.length === 0) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: "send_message: provide `text` and/or `attachments`" }],
-        };
-      }
-      // Validate every attachment path exists and is a regular file before
-      // we hand off to AppleScript — Messages.app's failure mode on a
-      // missing path is a silent UI alert with no stderr, which would
-      // otherwise look like a successful send.
-      for (const att of attachments) {
-        if (!path.isAbsolute(att)) {
+      // Stage inline (base64) attachments into a per-call temp dir. These
+      // paths are appended to any host-path `attachments` and cleaned up in
+      // the finally block below regardless of send outcome.
+      let b64Tmpdir: string | null = null;
+      const b64Paths: string[] = [];
+      if (params.attachments_b64) {
+        const staged = stageB64Attachments(params.attachments_b64);
+        if (staged.error) {
           return {
             isError: true,
-            content: [{ type: "text", text: `attachment path must be absolute: ${att}` }],
+            content: [{ type: "text", text: `send_message: ${staged.error}` }],
           };
         }
-        if (!existsSync(att)) {
-          return {
-            isError: true,
-            content: [{ type: "text", text: `attachment not found: ${att}` }],
-          };
-        }
-        const st = statSync(att);
-        if (!st.isFile()) {
-          return {
-            isError: true,
-            content: [{ type: "text", text: `attachment is not a regular file: ${att}` }],
-          };
-        }
+        b64Tmpdir = staged.tmpdir;
+        b64Paths.push(...staged.paths);
       }
 
-      const rec = resolveRecipient(params.to);
-      const service = params.service ?? "iMessage";
-      const script = buildSendScript(rec, text, attachments, service);
-      const result = await runOsascript(script);
-      if (!result.ok) {
+      try {
+        const attachments = [...(params.attachments ?? []), ...b64Paths];
+        if (text.length === 0 && attachments.length === 0) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: "send_message: provide `text` and/or `attachments`/`attachments_b64`" }],
+          };
+        }
+        // Validate every attachment path exists and is a regular file before
+        // we hand off to AppleScript — Messages.app's failure mode on a
+        // missing path is a silent UI alert with no stderr, which would
+        // otherwise look like a successful send. (Staged b64 paths are
+        // absolute + freshly written, so they pass these checks too.)
+        for (const att of attachments) {
+          if (!path.isAbsolute(att)) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `attachment path must be absolute: ${att}` }],
+            };
+          }
+          if (!existsSync(att)) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `attachment not found: ${att}` }],
+            };
+          }
+          const st = statSync(att);
+          if (!st.isFile()) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `attachment is not a regular file: ${att}` }],
+            };
+          }
+        }
+
+        const rec = resolveRecipient(params.to);
+        const service = params.service ?? "iMessage";
+        const script = buildSendScript(rec, text, attachments, service);
+        const result = await runOsascript(script);
+        if (!result.ok) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `osascript failed (exit ${result.code ?? "?"}): ${result.stderr || result.stdout || "(no output)"}`,
+              },
+            ],
+          };
+        }
         return {
-          isError: true,
           content: [
             {
               type: "text",
-              text: `osascript failed (exit ${result.code ?? "?"}): ${result.stderr || result.stdout || "(no output)"}`,
+              text: JSON.stringify({
+                ok: true,
+                recipient_kind: rec.kind,
+                recipient: rec.identifier,
+                service,
+                text_sent: text.length > 0,
+                attachments_sent: attachments.length,
+              }),
             },
           ],
         };
+      } finally {
+        if (b64Tmpdir) rmSync(b64Tmpdir, { recursive: true, force: true });
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              ok: true,
-              recipient_kind: rec.kind,
-              recipient: rec.identifier,
-              service,
-              text_sent: text.length > 0,
-              attachments_sent: attachments.length,
-            }),
-          },
-        ],
-      };
     },
   );
 }
